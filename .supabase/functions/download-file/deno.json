@@ -1,0 +1,7 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "strict": true,
+    "lib": ["deno.ns", "deno.window"]
+  }
+}
