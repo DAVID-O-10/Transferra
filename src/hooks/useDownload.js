@@ -1,6 +1,16 @@
 import { useState } from 'react'
 import { supabase } from '../lib/supabase'
 
+async function verifyPassword(password, hash) {
+  const encoder = new TextEncoder()
+  const data = encoder.encode(password)
+  const result = await crypto.subtle.digest('SHA-256', data)
+  const computed = Array.from(new Uint8Array(result))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('')
+  return computed === hash
+}
+
 export function useDownload() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -17,7 +27,7 @@ export function useDownload() {
     try {
       const { data, error: fetchError } = await supabase
         .from('transfers')
-        .select('id, code, file_name, file_size, file_type, expires_at, status, download_count, max_downloads, password_hash, sender_email, created_at')
+        .select('id, code, file_name, file_size, file_type, expires_at, status, download_count, max_downloads, password_hash, sender_email, r2_key, created_at')
         .eq('code', code.toUpperCase())
         .single()
 
@@ -25,22 +35,18 @@ export function useDownload() {
         throw new Error('Transfer not found. Check the code and try again.')
       }
 
-      // Check expiry
       if (new Date(data.expires_at) < new Date()) {
         throw new Error('This transfer has expired.')
       }
 
-      // Check if already deleted
       if (data.status === 'deleted') {
         throw new Error('This transfer has been deleted.')
       }
 
-      // Check if already fully downloaded
       if (data.status === 'downloaded') {
         throw new Error('This file has already been downloaded and deleted.')
       }
 
-      // Check max downloads
       if (data.max_downloads && data.download_count >= data.max_downloads) {
         throw new Error('Maximum download limit reached.')
       }
@@ -55,48 +61,68 @@ export function useDownload() {
     }
   }
 
-  // Download the file (calls Edge Function)
+  // Download the file (client-side via Supabase Storage signed URL)
   const downloadFile = async (code, password = '') => {
     setLoading(true)
     setError(null)
 
     try {
-      const { data, error: fnError } = await supabase.functions.invoke('download-file', {
-        body: {
-          transferCode: code.toUpperCase(),
-          password: password || undefined,
-        }
-      })
+      // Re-fetch the transfer to get latest state
+      const { data: transferData, error: fetchError } = await supabase
+        .from('transfers')
+        .select('*')
+        .eq('code', code.toUpperCase())
+        .single()
 
-      if (fnError) {
-        // Parse the error message from the Edge Function
-        const msg = data?.error || fnError.message || 'Download failed'
-        if (data?.requiresPassword) {
-          throw new Error('PASSWORD_REQUIRED')
-        }
-        throw new Error(msg)
+      if (fetchError || !transferData) {
+        throw new Error('Transfer not found.')
       }
 
-      // Check if password is required
-      if (data?.requiresPassword) {
-        return { requiresPassword: true }
+      // Check password if needed
+      if (transferData.password_hash) {
+        if (!password) {
+          return { requiresPassword: true }
+        }
+        const valid = await verifyPassword(password, transferData.password_hash)
+        if (!valid) {
+          throw new Error('Incorrect password. Try again.')
+        }
       }
 
-      // Trigger browser download via presigned URL
+      // Create signed URL from Supabase Storage
+      const { data: urlData, error: urlError } = await supabase.storage
+        .from('transfers')
+        .createSignedUrl(transferData.r2_key, 60)
+
+      if (urlError) {
+        console.error('Signed URL error:', urlError)
+        throw new Error('Could not generate download link. The file may have been removed.')
+      }
+
+      // Trigger browser download
       const a = document.createElement('a')
-      a.href = data.presignedUrl
-      a.download = data.filename
+      a.href = urlData.signedUrl
+      a.download = transferData.file_name
       document.body.appendChild(a)
       a.click()
       document.body.removeChild(a)
 
+      // Update download count
+      const newCount = (transferData.download_count || 0) + 1
+      const maxReached = transferData.max_downloads && newCount >= transferData.max_downloads
+
+      await supabase
+        .from('transfers')
+        .update({
+          download_count: newCount,
+          last_downloaded_at: new Date().toISOString(),
+          status: maxReached ? 'downloaded' : transferData.status,
+        })
+        .eq('id', transferData.id)
+
       setDownloaded(true)
-      return data
+      return { success: true }
     } catch (err) {
-      if (err.message === 'PASSWORD_REQUIRED') {
-        setError(null) // Don't show error — show password UI instead
-        return { requiresPassword: true }
-      }
       setError(err.message)
       return null
     } finally {
